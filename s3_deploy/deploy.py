@@ -5,17 +5,35 @@ import argparse
 import logging
 import gzip
 import shutil
-from email.utils import parsedate_tz, mktime_tz
 import mimetypes
+from datetime import datetime
 
-import boto
-from boto.s3.connection import S3Connection, OrdinaryCallingFormat
-from boto.s3.key import Key
+import boto3
 
 from six import BytesIO
+from six.moves.urllib.parse import quote_plus
 
 from . import config
 from .prefixcovertree import PrefixCoverTree
+
+# Support UTC timezone in 2.7
+try:
+    from datetime import timezone
+    UTC = timezone.utc
+except ImportError:
+    from datetime import tzinfo, timedelta
+
+    class UTCTz(tzinfo):
+        def utcoffset(self, dt):
+            return timedelta(0)
+
+        def tzname(self, dt):
+            return 'UTC'
+
+        def dst(self, dt):
+            return timedelta(0)
+
+    UTC = UTCTz()
 
 
 COMPRESSED_EXTENSIONS = frozenset([
@@ -40,10 +58,10 @@ def key_name_from_path(path):
     return '/'.join(reversed(key_parts))
 
 
-def upload_key(key, path, cache_rules, dry, replace=False):
+def upload_key(obj, path, cache_rules, dry):
     """Upload data in path to key."""
 
-    mime_guess = mimetypes.guess_type(key.key)
+    mime_guess = mimetypes.guess_type(obj.key)
     if mime_guess is not None:
         content_type = mime_guess[0]
     else:
@@ -53,13 +71,13 @@ def upload_key(key, path, cache_rules, dry, replace=False):
     try:
         encoding = None
 
-        cache_control = config.resolve_cache_rules(key.key, cache_rules)
+        cache_control = config.resolve_cache_rules(obj.key, cache_rules)
         if cache_control is not None:
             logger.debug('Using cache control: {}'.format(cache_control))
 
         _, ext = os.path.splitext(path)
         if ext in COMPRESSED_EXTENSIONS:
-            logger.info('Compressing {}...'.format(key.key))
+            logger.info('Compressing {}...'.format(obj.key))
             compressed = BytesIO()
             gzip_file = gzip.GzipFile(
                 fileobj=compressed, mode='wb', compresslevel=9)
@@ -71,25 +89,26 @@ def upload_key(key, path, cache_rules, dry, replace=False):
             content_file, _ = compressed, content_file.close()  # noqa
             encoding = 'gzip'
 
-        logger.info('Uploading {}...'.format(key.key))
+        logger.info('Uploading {}...'.format(obj.key))
 
         if not dry:
+            kwargs = {}
             if content_type is not None:
-                key.set_metadata('Content-Type', content_type)
+                kwargs['ContentType'] = content_type
             if cache_control is not None:
-                key.set_metadata(
-                    'Cache-Control', cache_control.encode('ascii'))
+                kwargs['CacheControl'] = cache_control
 
             if encoding is not None:
-                key.set_metadata('Content-Encoding', encoding)
+                kwargs['ContentEncoding'] = encoding
 
-            key.set_contents_from_file(content_file, replace=replace)
+            obj.put(Body=content_file.read(), **kwargs)
     finally:
         content_file.close()
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
+    logging.getLogger('boto3').setLevel(logging.WARNING)
 
     parser = argparse.ArgumentParser(
         description='AWS S3 website deployment tool')
@@ -112,8 +131,8 @@ def main():
 
     logger.info('Connecting to bucket {}...'.format(bucket_name))
 
-    conn = S3Connection(calling_format=OrdinaryCallingFormat())
-    bucket = conn.get_bucket(bucket_name, validate=False)
+    s3 = boto3.resource('s3')
+    bucket = s3.Bucket(bucket_name)
 
     site_dir = os.path.join(base_path, conf['site'])
 
@@ -122,35 +141,27 @@ def main():
     processed_keys = set()
     updated_keys = set()
 
-    for key in bucket:
-        processed_keys.add(key.key)
-        path = os.path.join(site_dir, key.key)
+    for obj in bucket.objects.all():
+        processed_keys.add(obj.key)
+        path = os.path.join(site_dir, obj.key)
 
         # Delete keys that have been deleted locally
         if not os.path.isfile(path):
-            logger.info('Deleting {}...'.format(key.key))
+            logger.info('Deleting {}...'.format(obj.key))
             if not args.dry:
-                key.delete()
-            updated_keys.add(key.key)
+                obj.delete()
+            updated_keys.add(obj.key)
             continue
 
         # Skip keys that have not been updated
-        mtime = int(os.path.getmtime(path))
+        mtime = datetime.fromtimestamp(os.path.getmtime(path), UTC)
         if not args.force:
-            # Update key metadata if not available.
-            # The bucket list() call that is executed through the bucket
-            # iteration above actually does obtain the last modified date
-            # from the server, but boto currently does not update the key
-            # variables based on that. We need to do an additional get_key()
-            # request to get the field populated.
-            key = bucket.get_key(key.key)
-            key_mtime = mktime_tz(parsedate_tz(key.last_modified))
-            if mtime <= key_mtime:
-                logger.info('Not modified, skipping {}.'.format(key.key))
+            if mtime <= obj.last_modified:
+                logger.info('Not modified, skipping {}.'.format(obj.key))
                 continue
 
-        upload_key(key, path, cache_rules, args.dry, replace=True)
-        updated_keys.add(key.key)
+        upload_key(obj, path, cache_rules, args.dry)
+        updated_keys.add(obj.key)
 
     for dirpath, dirnames, filenames in os.walk(site_dir):
         key_base = os.path.relpath(dirpath, site_dir)
@@ -160,13 +171,12 @@ def main():
             if key_name in processed_keys:
                 continue
 
-            # Create new key
-            key = Key(bucket)
-            key.key = key_name
+            # Create new object
+            obj = bucket.Object(key_name)
 
-            logger.info('Creating key {}...'.format(key_name))
+            logger.info('Creating key {}...'.format(obj.key))
 
-            upload_key(key, path, cache_rules, args.dry, replace=False)
+            upload_key(obj, path, cache_rules, args.dry)
             updated_keys.add(key_name)
 
     logger.info('Bucket update done.')
@@ -200,14 +210,25 @@ def main():
             logger.info('Preparing to invalidate {}...'.format(path))
             paths.append(path)
 
-        conn = boto.connect_cloudfront()
+        cloudfront = boto3.client('cloudfront')
 
         if len(paths) > 0:
             dist_id = conf['cloudfront_distribution_id']
             if not args.dry:
                 logger.info('Creating invalidation request...')
-                conn.create_invalidation_request(dist_id, paths)
+                response = cloudfront.create_invalidation(
+                    DistributionId=dist_id,
+                    InvalidationBatch=dict(
+                        Paths=dict(
+                            Quantity=len(paths),
+                            Items=['<Path>' + quote_plus(p) + '</Path>'
+                                   for p in paths]
+                        ),
+                        CallerReference='s3-deploy-website'
+                    )
+                )
+                invalidation = response['Invalidation']
+                logger.info('Invalidation request {} is {}'.format(
+                    invalidation['Id'], invalidation['Status']))
         else:
-            logger.info('Nothing updated, skipping invalidation...')
-
-        logger.info('Cloudfront invalidation done.')
+            logger.info('Nothing updated, invalidation skipped.')
