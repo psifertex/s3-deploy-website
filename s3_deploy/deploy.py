@@ -40,7 +40,7 @@ def key_name_from_path(path):
     return '/'.join(reversed(key_parts))
 
 
-def upload_key(key, path, cache_rules, dry, replace=False):
+def upload_key(key, path, cache_rules, dry, replace=False, reduced_redundancy=False):
     """Upload data in path to key."""
 
     mime_guess = mimetypes.guess_type(key.key)
@@ -83,7 +83,7 @@ def upload_key(key, path, cache_rules, dry, replace=False):
             if encoding is not None:
                 key.set_metadata('Content-Encoding', encoding)
 
-            key.set_contents_from_file(content_file, replace=replace)
+            key.set_contents_from_file(content_file, replace=replace, reduced_redundancy=reduced_redundancy)
     finally:
         content_file.close()
 
@@ -108,6 +108,7 @@ def main():
     conf, base_path = config.load_config_file(args.path)
 
     bucket_name = conf['s3_bucket']
+    reduced_redundancy = conf['s3_reduced_redundancy'] if 's3_reduced_redundancy' in conf.keys() else False
     cache_rules = conf.get('cache_rules', [])
 
     logger.info('Connecting to bucket {}...'.format(bucket_name))
@@ -149,7 +150,7 @@ def main():
                 logger.info('Not modified, skipping {}.'.format(key.key))
                 continue
 
-        upload_key(key, path, cache_rules, args.dry, replace=True)
+        upload_key(key, path, cache_rules, args.dry, replace=True, reduced_redundancy=reduced_redundancy)
         updated_keys.add(key.key)
 
     for dirpath, dirnames, filenames in os.walk(site_dir):
@@ -166,7 +167,7 @@ def main():
 
             logger.info('Creating key {}...'.format(key_name))
 
-            upload_key(key, path, cache_rules, args.dry, replace=False)
+            upload_key(key, path, cache_rules, args.dry, replace=False, reduced_redundancy=reduced_redundancy)
             updated_keys.add(key_name)
 
     logger.info('Bucket update done.')
