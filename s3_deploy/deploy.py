@@ -110,6 +110,7 @@ def main():
     conf, base_path = config.load_config_file(args.path)
 
     bucket_name = conf['s3_bucket']
+    cache_rules = conf.get('cache_rules', [])
     if 's3_reduced_redundancy' in conf.keys():
         reduced_redundancy = conf['s3_reduced_redundancy']
     else:
